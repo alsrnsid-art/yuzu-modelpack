@@ -1,0 +1,91 @@
+# 유자이야기 모델팩 최신화 알림
+#   pack 릴리스의 manifest.json 이 바뀌면 디스코드 웹후크로 알림을 보냅니다.
+#   - 15분마다 자동 확인 (+ 릴리스 수정 / 손으로 실행할 때도 확인)
+#   - 마지막으로 알린 manifest 의 해시를 .github/modelpack_last.txt 에 저장해서 같은 내용은 두 번 알리지 않음
+#   필요한 것 : 저장소 Settings -> Secrets and variables -> Actions -> New repository secret
+#               이름 DISCORD_WEBHOOK / 값 = 디스코드 웹후크 주소
+name: modelpack-notify
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  release:
+    types: [published, edited]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: modelpack-notify
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      MANIFEST_URL: https://github.com/alsrnsid-art/yuzu-modelpack/releases/download/pack/manifest.json
+      RELEASE_PAGE: https://github.com/alsrnsid-art/yuzu-modelpack/releases/tag/pack
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: manifest 받기
+        id: get
+        run: |
+          set -e
+          if ! curl -fsSL --retry 3 -o manifest.json "$MANIFEST_URL"; then
+            echo "manifest.json 을 받지 못했습니다 (아직 안 올렸거나 주소가 다름)"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          HASH=$(sha256sum manifest.json | cut -d' ' -f1)
+          LAST=$(cat .github/modelpack_last.txt 2>/dev/null || true)
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+          if [ "$HASH" = "$LAST" ]; then
+            echo "바뀐 것 없음"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 디스코드 알림
+        if: steps.get.outputs.ok == 'true'
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          set -e
+          # 버전 / 파일 수 / 총 크기 (manifest 키 이름이 달라도 최대한 찾아서 씀)
+          VER=$(jq -r '.version // .ver // .date // empty' manifest.json)
+          CNT=$(jq -r '(.files // .list // []) | length' manifest.json)
+          SIZE=$(jq -r '[(.files // .list // [])[] | (.size // .bytes // 0)] | add // 0' manifest.json)
+          NAMES=$(jq -r '[(.files // .list // [])[] | (.name // .file // .path // empty)] | join("\n")' manifest.json | head -c 900)
+          SIZE_GB=$(awk -v s="$SIZE" 'BEGIN{ if (s>0) printf "%.2fGB", s/1073741824; else print "" }')
+          [ -z "$VER" ] && VER=$(date -u -d '+9 hours' '+%Y-%m-%d %H:%M')
+          DESC="모델팩이 최신화되었습니다. 설치 프로그램을 다시 실행하면 바뀐 파일만 받습니다."
+          jq -n --arg ver "$VER" --arg cnt "$CNT" --arg size "$SIZE_GB" --arg names "$NAMES" \
+                --arg desc "$DESC" --arg url "$RELEASE_PAGE" '
+            {
+              username: "모델팩 최신화봇",
+              embeds: [{
+                title: "📦 유자이야기 모델팩 업데이트",
+                url: $url,
+                description: $desc,
+                color: 16753920,
+                fields: ([
+                  {name: "버전", value: $ver, inline: true},
+                  {name: "파일", value: ($cnt + "개"), inline: true}
+                ] + (if $size != "" then [{name: "총 크기", value: $size, inline: true}] else [] end)
+                  + (if $names != "" then [{name: "파일 목록", value: ("```\n" + $names + "\n```")}] else [] end))
+              }]
+            }' > payload.json
+          curl -fsS -H "Content-Type: application/json" -d @payload.json "$WEBHOOK"
+
+      - name: 마지막으로 알린 버전 저장
+        if: steps.get.outputs.ok == 'true'
+        run: |
+          echo "${{ steps.get.outputs.hash }}" > .github/modelpack_last.txt
+          git config user.name "modelpack-bot"
+          git config user.email "modelpack-bot@users.noreply.github.com"
+          git add .github/modelpack_last.txt
+          git commit -m "모델팩 알림 기록 갱신" || exit 0
+          git push
