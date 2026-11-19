@@ -1,0 +1,59 @@
+# YUZU.mix 의 ReplaceableTextures 93개 되돌리기 (한 번 쓰고 지울 작업)
+#   정리할 때 빠졌던 ReplaceableTextures / war3mapImported\ReplaceableTextures 파일을 원래대로 다시 넣음
+name: yuzu-mix-fix
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/yuzu_fix/**', '.github/workflows/yuzu-fix.yml']
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: yuzu-mix-fix
+  cancel-in-progress: false
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SRC_SHA: e5ca427ef179f302c8c36ac1bf87514a236d8cf37b32ee5b50b5a9bd2c378121
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: StormLib 설치
+        run: sudo apt-get update -q && sudo apt-get install -y -q libstorm9
+
+      - name: 지금 YUZU.mix / manifest 받기
+        run: |
+          gh release download pack -R "$GITHUB_REPOSITORY" -p YUZU.mix -p manifest.json -D src
+          echo "$SRC_SHA  src/YUZU.mix" | sha256sum -c -
+
+      - name: 93개 다시 넣어 묶기 (앞머리 3072 바이트는 그대로) + 확인
+        run: |
+          head -c 3072 src/YUZU.mix > stub.bin
+          tail -c +3073 src/YUZU.mix > cur.mpq
+          mkdir add && tar xzf .github/yuzu_fix/add.tgz -C add
+          python3 .github/yuzu_fix/rebuild.py cur.mpq new.mpq .github/yuzu_fix/plan.tsv .github/yuzu_fix/add_list.txt add
+          cat stub.bin new.mpq > YUZU.mix
+          python3 .github/yuzu_fix/verify_mix.py YUZU.mix .github/yuzu_fix/expect.tsv
+          cmp <(head -c 3072 YUZU.mix) stub.bin
+          ls -l src/YUZU.mix YUZU.mix
+
+      - name: manifest 고치기
+        run: |
+          SHA=$(sha256sum YUZU.mix | cut -d' ' -f1)
+          SIZE=$(stat -c %s YUZU.mix)
+          jq --arg s "$SHA" --argjson z "$SIZE" \
+            '(.files[] | select(.name=="YUZU.mix")) |= (.sha256=$s | .size=$z)' src/manifest.json > manifest.json
+          cat manifest.json
+
+      - name: 릴리스에 올리기 (제목은 그대로) + 최신화 알림
+        run: |
+          gh release upload pack YUZU.mix --clobber -R "$GITHUB_REPOSITORY"
+          gh release upload pack manifest.json --clobber -R "$GITHUB_REPOSITORY"
+          gh workflow run modelpack-notify.yml -R "$GITHUB_REPOSITORY" --ref main
